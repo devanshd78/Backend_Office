@@ -1,231 +1,382 @@
-from flask import Flask, request, send_file, jsonify, Blueprint
-from fpdf import FPDF
-import os
-import time
-from datetime import datetime, timedelta
+from flask import Blueprint, request, send_file
 import io
-from pymongo import MongoClient
+import os
+import logging
+from datetime import datetime
+from fpdf import FPDF
+from pymongo import ReturnDocument
+
+from utils import format_response
 from db import db
 
-invoice_bp = Blueprint("invoice", __name__, url_prefix="/invoice")
+# Import helper to fetch editable fields
+from settings import get_current_settings
 
-# COLORS
-BLACK      = (0, 0, 0)
-LIGHT_PINK = (255, 240, 245)
-DARK_PINK  = (219, 112, 147)
+# Configure logging
+logging.basicConfig(level=logging.ERROR)
 
-# Company info
-COMPANY_INFO = {
-    "name":       "MHD Tech",
-    "address":    "8825 Perimeter Park Blvd Ste 501",
-    "city_state": "Jacksonville, Florida, USA",
-    "phone":      "+15075561971",
-    "youtube":    "youtube.com/@mhd_tech",
-    "email":      "aria@mhdtechpro.com"
+invoice_bp = Blueprint("invoice", __name__, url_prefix="/invoiceMHD")
+
+# Default settings for invoice template
+DEFAULT_SETTINGS = {
+    "_id": "default",
+    "logo_path": "logomhd.png",
+    "fonts": {
+        "regular": os.path.join('static', 'Lexend-Regular.ttf'),
+        "bold":    os.path.join('static', 'Lexend-Bold.ttf')
+    },
+    "colors": {
+        "black":      [0, 0, 0],
+        "light_pink": [244, 225, 230],
+        "dark_pink":  [91, 17, 44]
+    },
+    "company_info": {
+        "name":       "MHD Tech",
+        "address":    "8825 Perimeter Park Blvd Ste 501",
+        "city_state": "Jacksonville, Florida, USA",
+        "phone":      "+15075561971",
+        "youtube":    "youtube.com/@mhd_tech",
+        "email":      "aria@mhdtechpro.com"
+    },
+    # ← NEW
+    "paypal_details": {
+        "receiver_email": "support@enoylity.com",
+        "paypal_name":    "Enoylity Media Creation"
+    },
+    "bank_details": {
+        "account_name":   "Enoylity Media Creations LLC",
+        "account_number": "200000523466",
+        "routing_number": "064209588",
+        "bank_name":      "Thread Bank",
+        "bank_address":   "210 E Main St, Rogersville TN 37857"
+    }
 }
 
+
+# PDF generator using dynamic settings
 class InvoicePDF(FPDF):
+    def __init__(self, settings, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.settings = settings
+        self.add_font('Lexend', '', settings['fonts']['regular'], uni=True)
+        self.add_font('Lexend', 'B', settings['fonts']['bold'], uni=True)
+
     def header(self):
-        logo_path = 'logomhd.jpeg'
-        if os.path.isfile(logo_path):
-            self.image(logo_path, x=self.w - self.r_margin - 40, y=10, w=40)
+        logo = self.settings['logo_path']
+        if os.path.isfile(logo):
+            self.image(logo, x=self.w - self.r_margin - 40, y=10, w=40)
         self.set_xy(self.l_margin, 10)
-        self.set_font('Arial', 'B', 18)
-        self.set_text_color(*BLACK)
-        self.cell(0, 10, COMPANY_INFO['name'], ln=1)
-        self.set_font('Arial', '', 11)
-        self.cell(0, 6, COMPANY_INFO['address'], ln=1)
-        self.cell(0, 6, COMPANY_INFO['city_state'], ln=1)
-        self.cell(0, 6, f"Phone: {COMPANY_INFO['phone']}", ln=1)
-        self.set_text_color(0, 0, 255)
-        self.cell(0, 6, COMPANY_INFO['youtube'], ln=1, link=f"https://{COMPANY_INFO['youtube']}")
-        self.cell(0, 6, COMPANY_INFO['email'], ln=1, link=f"mailto:{COMPANY_INFO['email']}")
-        self.set_text_color(*BLACK)
+        self.set_font('Lexend', 'B', 28)
+        self.set_text_color(*self.settings['colors']['black'])
+        self.cell(0, 10, self.settings['company_info']['name'], ln=1)
+        self.set_font('Lexend', '', 11)
+        ci = self.settings['company_info']
+        self.cell(0, 6, ci['address'], ln=1)
+        self.cell(0, 6, ci['city_state'], ln=1)
+        self.cell(0, 6, f"Phone: {ci['phone']}", ln=1)
+        self.cell(0, 6, ci.get('youtube', ''), ln=1)
+        self.cell(0, 6, ci['email'], ln=1)
         self.ln(12)
 
     def footer(self):
         self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.set_text_color(100, 100, 100)
-        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+        self.set_font('Lexend', '', 8)
+        pass
+# Invoice number generator
+def get_next_invoice_number():
+    counter = db.invoice_counters.find_one_and_update(
+        {"_id": "MHD Tech counter"},
+        {"$inc": {"sequence_value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    seq = counter.get("sequence_value", 1)
+    return f"INV{seq:05d}"
 
 @invoice_bp.route('/generate-invoice', methods=['POST'])
 def generate_invoice_endpoint():
     try:
-        data = request.get_json()
-        bt_name    = data['bill_to_name']
-        bt_addr    = data['bill_to_address']
-        bt_city    = data['bill_to_city']
-        bt_mail    = data['bill_to_email']
-        items      = data.get('items', [])
-        invoice_date = data['invoice_date']  # "DD-MM-YYYY"
-        payment_method = data.get('payment_method', 0)  # 0 = PayPal, 1 = Bank
+        # 1️⃣ Fetch editable fields for the "MHD" invoice type
+        raw = db.settings_invoice.find_one({"invoice_type": "MHD Tech"}) or {}
+        editable = raw.get("editable_fields", {})
+        print(editable)
+        # 2️⃣ Merge into defaults (without mutating them)
+        import copy
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        for key, val in editable.items():
+            if isinstance(val, dict) and key in settings:
+                settings[key].update(val)
+            else:
+                settings[key] = val
 
-        # Invoice counter logic (same as before)
-        counter_file = 'invoice_counter.txt'
-        if not os.path.exists(counter_file):
-            with open(counter_file, 'w') as f:
-                f.write('0')
-        with open(counter_file, 'r+') as f:
-            idx = int(f.read().strip()) + 1
-            f.seek(0)
-            f.write(str(idx))
-            f.truncate()
-        inv_no = f"INV{idx:05d}"
+        # 4️⃣ Validate payload
+        data = request.get_json() or {}
+        phone = data.get('bill_to_phone')
+        if phone:
+            if not phone.isdigit() or len(phone) != 10:
+                return format_response(False, "Phone number must be exactly 10 digits if provided", status=400)
+        
+        required_fields = {
+            "bill_to_name":     "Billing name is required",
+            "bill_to_address":  "Billing address is required",
+            "bill_to_email":    "Billing email is required",
+            "invoice_date":     "Invoice date is required",
+            "due_date":         "Due date is required"
+        }
 
-        # Compute due date = bill date + 6 days
-        bd = datetime.strptime(invoice_date, '%d-%m-%Y')
-        due_date = (bd + timedelta(days=6)).strftime('%d-%m-%Y')
+        for field, error_msg in required_fields.items():
+            if not data.get(field):
+                return format_response(False, error_msg, status=400)
 
-        # Build PDF in memory (same as before)
-        pdf = InvoicePDF()
+
+        # 5️⃣ Parse fields
+        bt_name = data['bill_to_name']
+        bt_addr = data['bill_to_address']
+        bt_mail = data['bill_to_email']
+        bt_phone = data['bill_to_phone']
+        note    = data['notes']
+        bank_note = data['bank_Note']
+        items   = data.get('items', [])
+        payment_method = int(data.get('payment_method', None))
+
+        inv_no = get_next_invoice_number()
+        # Validate dates
+        try:
+            datetime.strptime(data['invoice_date'], '%d-%m-%Y')
+            datetime.strptime(data['due_date'],   '%d-%m-%Y')
+        except ValueError:
+            return format_response(False, "Invalid date format. Use DD-MM-YYYY", status=400)
+
+        # 6️⃣ Build PDF
+        pdf = InvoicePDF(settings)
         pdf.invoice_number = inv_no
-        pdf.invoice_date   = invoice_date
-        pdf.due_date       = due_date
+        pdf.invoice_date   = data['invoice_date']
+        pdf.due_date       = data['due_date']
         pdf.add_page()
 
-        # ---- Bill To section ----
-        pdf.set_fill_color(*LIGHT_PINK)
-        pdf.set_text_color(*BLACK)
-        pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 8, 'Bill To:', ln=1, fill=True)
-        pdf.set_font('Arial', '', 11)
-        for line in (bt_name, bt_addr, bt_city, bt_mail):
-            pdf.cell(0, 6, line, ln=1, fill=True)
+        # Bill To block
+        lines = ["Bill To:"] + [bt_name, bt_addr, bt_phone, bt_mail]
+        heights = [8] + [6]*(len(lines)-1)
+        block_w = pdf.w - pdf.l_margin - pdf.r_margin
+        x, y = pdf.get_x(), pdf.get_y()
+        pdf.set_fill_color(*settings['colors']['light_pink'])
+        pdf.rect(x, y, block_w, sum(heights), 'F')
+        pdf.set_text_color(*settings['colors']['black'])
+        for h, txt, style in zip(heights, lines, ['B'] + ['']*(len(lines)-1)):
+            pdf.set_font('Lexend', style, 12 if style=='B' else 11)
+            pdf.set_xy(x, y)
+            pdf.cell(0, h, txt, ln=1)
+            y += h
+        pdf.ln(4)
+
+        # Invoice Details block
+        details = [
+            "Invoice Details:",
+            f"Invoice #: {inv_no}",
+            f"Bill Date: {data['invoice_date']}",
+            f"Due Date: {data['due_date']}"
+        ]
+        d_heights = [8] + [7]*(len(details)-1)
+        x, y = pdf.get_x(), pdf.get_y()
+        pdf.set_fill_color(*settings['colors']['light_pink'])
+        pdf.rect(x, y, block_w, sum(d_heights), 'F')
+        pdf.set_text_color(*settings['colors']['black'])
+        for h, txt, style in zip(d_heights, details, ['B'] + ['']*(len(details)-1)):
+            pdf.set_font('Lexend', style, 12 if style=='B' else 11)
+            pdf.set_xy(x, y)
+            pdf.cell(0, h, txt, ln=1)
+            y += h
         pdf.ln(10)
 
-        # ---- Invoice Details section ----
-        pdf.set_fill_color(*LIGHT_PINK)
-        pdf.set_text_color(*BLACK)
-        pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 8, 'Invoice Details:', ln=1, fill=True)
-        pdf.set_font('Arial', '', 11)
-        pdf.cell(0, 7, f"Invoice #: {inv_no}", ln=1, fill=True)
-        pdf.cell(0, 7, f"Bill Date: {invoice_date}", ln=1, fill=True)
-        pdf.cell(0, 7, f"Due Date:  {due_date}", ln=1, fill=True)
-        pdf.ln(10)
+        # Items table header
+        pdf.set_fill_color(*settings['colors']['dark_pink'])
+        pdf.set_text_color(255,255,255)
+        pdf.set_font('Lexend','B',12)
+        pdf.cell(90,10,'DESCRIPTION',0,0,'C',fill=True)
+        pdf.cell(30,10,'RATE',0,0,'C',fill=True)
+        pdf.cell(20,10,'QTY',0,0,'C',fill=True)
+        pdf.cell(45,10,'AMOUNT',0,1,'C',fill=True)
 
-        # ---- Items table ----
-        pdf.set_fill_color(*DARK_PINK)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font('Arial', 'B', 12)
-        pdf.cell(90, 10, 'DESCRIPTION', 0, 0, 'C', fill=True)
-        pdf.cell(30, 10, 'RATE', 0, 0, 'C', fill=True)
-        pdf.cell(20, 10, 'QTY', 0, 0, 'C', fill=True)
-        pdf.cell(45, 10, 'AMOUNT', 0, 1, 'C', fill=True)
-
-        pdf.set_text_color(*BLACK)
-        pdf.set_font('Arial', '', 11)
+        # Items rows
+        pdf.set_text_color(*settings['colors']['black'])
+        pdf.set_font('Lexend','',11)
         subtotal = 0
         for it in items:
-            desc = it.get('description', '')
-            rate = it.get('price', 0.0)
-            qty  = it.get('quantity', 1)
+            desc = it.get('description','')
+            rate = float(it.get('price',0))
+            qty  = int(it.get('quantity',1))
             amt  = rate * qty
             subtotal += amt
+            pdf.cell(90,8,desc,0,0,'L')
+            pdf.cell(30,8,f'$ {rate:.2f}',0,0,'C')
+            pdf.cell(20,8,str(qty),0,0,'C')
+            pdf.cell(45,8,f'$ {amt:.2f}',0,1,'C')
 
-            pdf.cell(90, 8, desc, 0, 0, 'L')
-            pdf.cell(30, 8, f'${rate:.2f}', 0, 0, 'R')
-            pdf.cell(20, 8, str(qty), 0, 0, 'C')
-            pdf.cell(45, 8, f'${amt:.2f}', 0, 1, 'R')
-
-        # ---- PayPal fee logic ----
+        # PayPal fee if applicable
         if payment_method == 0:
-            fee = subtotal * 0.053
+            fee = subtotal * 0.056
             total = subtotal + fee
             pdf.ln(4)
-            pdf.set_font('Arial', '', 11)
-            pdf.cell(140, 8, 'PayPal Fee (5.3%)', 0, 0, 'R')
-            pdf.cell(45, 8, f'${fee:.2f}', 0, 1, 'R')
+            pdf.set_font('Lexend','',13)
+            pdf.cell(140,8,'PayPal Fee',0,0,'R')
+            pdf.cell(45,8,f'$ {fee:.2f}',0,1,'C')
         else:
             total = subtotal
-
         pdf.ln(8)
-        # ---- Total ----
-        pdf.set_font('Arial', 'B', 14)
-        pdf.set_text_color(*BLACK)
-        pdf.cell(141, 10, 'TOTAL', 0, 0, 'R')
-        pdf.cell(45, 10, f'USD ${total:.2f}', 0, 1, 'R')
-        pdf.ln(10)
+        pdf.set_font('Lexend','B',14)
+        pdf.cell(135,8,'TOTAL ',0,0,'R')
+        pdf.cell(39,8,f'USD $ {total:.2f}',0,1,'C')
 
-        # ---- Default note ----
-        pdf.set_font('Arial', 'I', 12)
-        pdf.set_text_color(*BLACK)
-        pdf.multi_cell(0, 6, 'Note: Thank you for your business.', 0, 'L')
+        pdf.ln(12)
 
-        # Insert the invoice data into MongoDB
-        invoice_data = {
-            "invoice_number": inv_no,
-            "bill_to": {
-                "name": bt_name,
-                "address": bt_addr,
-                "city": bt_city,
-                "email": bt_mail
+        full_w = pdf.w - pdf.l_margin - pdf.r_margin
+        note_w = 80  # REDUCED width for your Notes column (to push it more to the right)
+        left_w = full_w - note_w - 20  # Added 20 points of extra space between columns
+
+        # Remember current Y
+        y0 = pdf.get_y()
+
+        # Left column: Bank or PayPal Details
+        pdf.set_xy(pdf.l_margin, y0)
+        pdf.set_font('Lexend', 'B', 12)
+        if payment_method == 0:
+            pdf.cell(left_w, 6, 'PayPal Details:', 0)
+            
+            # Right column: Notes heading (on the same line as PayPal Details) - moved further right
+            if note:
+                pdf.set_xy(pdf.l_margin + left_w + 20, y0)
+                pdf.cell(note_w, 6, 'Note:', 0, 1)
+
+                # Content under “Note:”
+                pdf.set_xy(pdf.l_margin + left_w + 20, y0 + 6)
+                pdf.set_font('Lexend', '', 11)
+                pdf.multi_cell(note_w, 5, note, 0)
+
+
+
+                
+            # Continue with PayPal details
+            pdf.set_xy(pdf.l_margin, y0 + 6)
+            pd = settings['paypal_details']
+            pdf.set_font('Lexend', '', 11)
+            pdf.cell(left_w, 5, f"Name : {pd.get('paypal_name','')}", ln=1)
+            pdf.cell(left_w, 5, f"Email: {pd.get('receiver_email','')}", ln=1)
+
+        elif payment_method == 1:
+            pdf.cell(left_w, 6, 'Bank Details:', 0)
+            
+            # Right column: Notes heading (on the same line as Bank Details) - moved further right
+            if note:
+                pdf.set_xy(pdf.l_margin + left_w + 20, y0)
+                pdf.cell(note_w, 6, 'Note:', 0, 1)
+
+                # Content under “Note:”
+                pdf.set_xy(pdf.l_margin + left_w + 20, y0 + 6)
+                pdf.set_font('Lexend', '', 11)
+                pdf.multi_cell(note_w, 5, note, 0)
+
+            # Continue with Bank details
+            pdf.set_xy(pdf.l_margin, y0 + 6)
+            bd = settings['bank_details']
+            pdf.set_font('Lexend', '', 11)
+            pdf.cell(left_w, 5, f"Account Name  : {bd.get('account_name','')}", ln=1)
+            pdf.cell(left_w, 5, f"Account Number: {bd.get('account_number','')}", ln=1)
+            pdf.cell(left_w, 5, f"Routing Number: {bd.get('routing_number','')}", ln=1)
+            pdf.cell(left_w, 5, f"Bank Name     : {bd.get('bank_name','')}", ln=1)
+            pdf.cell(left_w, 5, f"Bank Address  : {bd.get('bank_address','')}", ln=1)
+
+
+
+            if bank_note:
+                # move down a bit below bank details
+                start_y = pdf.get_y() + 6
+                pdf.set_xy(pdf.l_margin, start_y)
+
+                # Bank Note heading
+                pdf.set_font('Lexend', 'B', 11)
+                pdf.cell(note_w, 6, 'Bank Note:', 0, 1)
+
+                # Bank Note content
+                pdf.set_font('Lexend', '', 11)
+                pdf.multi_cell(note_w, 5, bank_note, 0)
+
+        else:
+            if note:
+                pdf.set_xy(pdf.l_margin, y0)
+                pdf.cell(note_w, 6, 'Note:', 0, 1)
+                # Notes content - positioned at right column, under "Note:" heading
+                notes_x = pdf.l_margin  # Added 20 points of space
+                notes_y = y0 + 6  # Start notes content below the heading
+                pdf.set_xy(notes_x, notes_y)
+                pdf.set_font('Lexend', '', 11)
+                pdf.multi_cell(note_w, 5, note, 0)  # Default left alignment
+                pass
+
+        # Save record
+        db.invoiceMHD.insert_one({
+            'invoice_number': inv_no,
+            'bill_to': {
+                'name': bt_name,
+                'address': bt_addr,
+                'email': bt_mail,
+                'phone': bt_phone
             },
-            "items": items,
-            "invoice_date": invoice_date,
-            "due_date": due_date,
-            "total_amount": total,
-            "payment_method": payment_method
-        }
-        db.mhdinvoice.insert_one(invoice_data)
+            'items': items,
+            'invoice_date': data['invoice_date'],
+            'due_date': data['due_date'],
+            'notes': note,
+            'bank_Note':bank_note,
+            'total_amount': total,
+            'payment_method': payment_method
+        })
 
-        # Stream PDF to client
-        buffer = io.BytesIO()
-        buffer.write(pdf.output(dest='S').encode('latin1'))
-        buffer.seek(0)
+        # Stream PDF back to client
+        buf = io.BytesIO(pdf.output(dest='S').encode('latin1'))
+        buf.seek(0)
         return send_file(
-            buffer,
+            buf,
             mimetype='application/pdf',
             as_attachment=True,
             download_name=f"invoice_{inv_no}.pdf"
         )
 
-    except KeyError as ke:
-        return jsonify({"error": f"Missing field: {ke}"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logging.exception("Error generating invoice")
+        return format_response(False, "Internal server error", status=500)
+
 
 @invoice_bp.route('/getlist', methods=['POST'])
 def get_invoice_list():
     try:
-        # Get search query and pagination data
-        data = request.get_json()
-        page = data.get('page', 1)
-        per_page = data.get('per_page', 10)
-        search_query = data.get('search', '')
+        data = request.get_json() or {}
+        page     = int(data.get('page', 1))
+        per_page = int(data.get('per_page', 10))
+        search   = (data.get('search') or '').strip()
 
-        # Build search filter based on the query
-        filter_criteria = {}
-        if search_query:
-            search_regex = {"$regex": search_query, "$options": "i"}  # Case-insensitive regex
-            filter_criteria = {
-                "$or": [
-                    {"invoice_number": search_regex},   # Search by invoice_number
-                    {"bill_to.name": search_regex},      # Search by bill_to.name
-                    {"invoice_date": search_regex}       # Search by invoice_date
-                ]
+        criteria = {}
+        if search:
+            regex = {'$regex': search, '$options': 'i'}
+            criteria = {'$or': [
+                {'invoice_number': regex},
+                {'bill_to.name':  regex},
+                {'invoice_date':  regex},
+                {'due_date':      regex}
+            ]}
+
+        skip    = (page - 1) * per_page
+        cursor  = db.invoiceMHD.find(criteria).skip(skip).limit(per_page)
+        invoices = [{**inv, '_id': str(inv['_id'])} for inv in cursor]
+        total    = db.invoiceMHD.count_documents(criteria)
+
+        return format_response(
+            True,
+            'Invoice list retrieved',
+            data={
+                'invoices': invoices,
+                'total': total,
+                'page': page,
+                'per_page': per_page
             }
-
-        # Calculate pagination
-        skip = (page - 1) * per_page
-        invoices_cursor = db.mhdinvoice.find(filter_criteria).skip(skip).limit(per_page)
-
-        # Get the invoices as a list
-        invoices = []
-        for invoice in invoices_cursor:
-            invoice['_id'] = str(invoice['_id'])
-            invoices.append(invoice)
-
-        total_invoices = db.mhdinvoice.count_documents(filter_criteria)
-
-        # Return paginated invoices
-        return jsonify({
-            "invoices": invoices,
-            "total": total_invoices,
-            "page": page,
-            "per_page": per_page
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        )
+    except Exception:
+        return format_response(False, 'Internal server error', status=500)
