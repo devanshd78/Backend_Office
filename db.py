@@ -1,15 +1,15 @@
 import os
 import certifi
 from pymongo import MongoClient
+from dotenv import load_dotenv
+load_dotenv()
 
 # Option A: hard-code (not recommended)
 # uri = "mongodb+srv://Invoice:<db_password>@invoice.nlglhbe.mongodb.net/invoice_db?retryWrites=true&w=majority&appName=Invoice"
 
 # Option B: pull from env var (best practice)
-uri = os.getenv(
-    "MONGODB_URI",
-    "mongodb+srv://Invoice:Invoice123@invoice.nlglhbe.mongodb.net/invoice_db?retryWrites=true&w=majority&appName=Invoice"
-)
+uri = os.getenv("MONGODB_URI")
+
 
 # Create the client, using certifi’s CA bundle for proper TLS validation
 client = MongoClient(
