@@ -20,7 +20,7 @@ invoice_bp = Blueprint("invoice", __name__, url_prefix="/invoiceMHD")
 # Default settings for invoice template
 DEFAULT_SETTINGS = {
     "_id": "default",
-    "logo_path": "logomhd.png",
+    "logo_path": "logomhd.jpeg",
     "fonts": {
         "regular": os.path.join('static', 'Lexend-Regular.ttf'),
         "bold":    os.path.join('static', 'Lexend-Bold.ttf')
