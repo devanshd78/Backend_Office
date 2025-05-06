@@ -119,7 +119,6 @@ def generate_invoice_endpoint():
         required_fields = {
             "bill_to_name":     "Billing name is required",
             "bill_to_address":  "Billing address is required",
-            "bill_to_email":    "Billing email is required",
             "invoice_date":     "Invoice date is required",
             "due_date":         "Due date is required"
         }
@@ -130,14 +129,16 @@ def generate_invoice_endpoint():
 
 
         # 5️⃣ Parse fields
-        bt_name = data['bill_to_name']
-        bt_addr = data['bill_to_address']
-        bt_mail = data['bill_to_email']
-        bt_phone = data['bill_to_phone']
-        note    = data['notes']
-        bank_note = data['bank_Note']
-        items   = data.get('items', [])
-        payment_method = int(data.get('payment_method', None))
+        bt_name  = data['bill_to_name']
+        bt_addr  = data['bill_to_address']
+        bt_mail  = data.get('bill_to_email', '') or ''
+        bt_phone = data.get('bill_to_phone', '') or ''
+        note     = data.get('notes', '') or ''
+        bank_note = data.get('bank_Note', '') or ''
+        items    = data.get('items', [])
+        payment_method = data.get('payment_method')
+        payment_method = int(payment_method) if payment_method not in (None, '', 'null') else None
+
 
         inv_no = get_next_invoice_number()
         # Validate dates
